@@ -7,8 +7,9 @@ const productRoutes = require('./routes/productRoutes');
 const pantryRoutes = require('./routes/pantryRoutes');
 const subscriptionRoutes = require('./routes/subscriptionRoutes');
 const orderRoutes = require('./routes/orderRoutes');
+const statsRoutes = require('./routes/statsRoutes');
 const app = express();
-
+const userRoutes = require('./routes/userRoutes');
 // Middleware
 app.use(cors({
   origin: 'http://localhost:3000', // Allow only your frontend
@@ -23,7 +24,8 @@ app.use('/api/products', productRoutes);
 app.use('/api/pantry', pantryRoutes);
 app.use('/api/subscription', subscriptionRoutes);
 app.use('/api/orders', orderRoutes);
-
+app.use('/api/stats', statsRoutes);
+app.use('/api/users', userRoutes);
 // Base Route
 app.get('/', (req, res) => {
   res.send('PantryPal API is running...');
