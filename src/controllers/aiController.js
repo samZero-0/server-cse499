@@ -3,82 +3,61 @@ const Order = require('../models/Order');
 const PantryItem = require('../models/PantryItem');
 const Product = require('../models/Product');
 const Cart = require('../models/Cart');
+const User = require('../models/User');
+const Subscription = require('../models/Subscription');
 
-// @desc    Chat with AI (Context-Aware + Memory + Tools + DEBUGGING)
+// @desc    Chat with AI (Smart: Chat + Actions + Clear Cart)
 // @route   POST /api/ai/chat
 const chatWithAI = async (req, res) => {
   const { message, history } = req.body;
   const userId = req.user._id;
 
   const groqApiKey = process.env.GROQ_API_KEY;
-
-  if (!groqApiKey) {
-    console.error("DEBUG: Groq API key is missing.");
-    return res.status(500).json({ reply: "AI is unavailable: missing API key." });
-  }
+  if (!groqApiKey) return res.status(500).json({ reply: "AI is unavailable." });
 
   const groq = new Groq({ apiKey: groqApiKey });
 
   try {
-    // ====================================================
-    // 1. GATHER DATA CONTEXT
-    // ====================================================
+    // 1. GATHER CONTEXT
+    const products = await Product.find().select('name price stock').limit(100);
+    const productCatalog = products.map(p => `- ${p.name}`).join('\n');
 
-    // Fetch products (Limit 50)
-    const products = await Product.find().select('name price stock category').limit(50);
-    const productCatalog = products.map(p => 
-        `- ${p.name}: ৳${p.price} (${p.stock > 0 ? 'In Stock' : 'Out of Stock'})`
-    ).join('\n');
+    const userCart = await Cart.findOne({ user: userId });
+    let cartSummary = "Empty";
+    if (userCart && userCart.items.length > 0) {
+        cartSummary = userCart.items.map(item => `${item.quantity}x ${item.name}`).join(', ');
+    }
 
-    // Fetch User Stats
-    const orders = await Order.find({ user: userId });
-    const totalSpent = orders.reduce((acc, order) => acc + order.totalPrice, 0);
-
-    const pantryItems = await PantryItem.find({ user: userId });
-    const allPantryNames = pantryItems.map(i => i.name).join(', ');
-    
-    // Find expiring items
-    const expiringItems = pantryItems.filter(item => {
-        const expiryDate = new Date(item.purchaseDate);
-        expiryDate.setDate(expiryDate.getDate() + item.shelfLifeDays);
-        const diffDays = Math.ceil((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
-        return diffDays <= 3 && diffDays >= 0;
-    }).map(i => i.name).join(', ');
-
-    // ====================================================
-    // 2. CONSTRUCT SYSTEM PROMPT
-    // ====================================================
+    // 2. SYSTEM PROMPT (Added CLEAR_CART back!)
     const systemPrompt = `
-      You are PantryPal AI. You have access to the store's inventory and the user's pantry.
+      You are PantryPal AI.
       
-      --- STORE INVENTORY (Name: Price) ---
+      --- INVENTORY ---
       ${productCatalog}
       
-      --- USER CONTEXT ---
-      - Total Spent: ৳${totalSpent}
-      - Pantry Items: ${allPantryNames || "Empty"}
-      - Expiring Soon: ${expiringItems || "None"}
+      --- CURRENT CART ---
+      ${cartSummary}
       
       --- INSTRUCTIONS ---
-      1. MEMORY: Use the conversation history to understand context.
-      2. PRICE CHECKS: Check the INVENTORY list for prices.
-      3. **ACTION - ADD TO CART**: If the user explicitly asks to add items to cart, you must reply with a JSON OBJECT ONLY.
-         Format: { "action": "ADD_TO_CART", "productName": "exact_product_name_from_inventory", "quantity": number }
-         Example: User says "Add 2 milk", you output: { "action": "ADD_TO_CART", "productName": "Fresh Milk (1L)", "quantity": 2 }
-      4. NORMAL CHAT: For everything else, chat normally. Keep answers short.
+      1. **GENERAL CHAT:** If the user greets you ("hi"), asks for recipes, or asks questions, use **NORMAL TEXT**.
+      
+      2. **SHOPPING ACTIONS:** If the user asks to Add, Remove, Subscribe, Clear, or Checkout, return a **JSON ARRAY**:
+         - Add: [{"action": "ADD_TO_CART", "productName": "Exact Name", "quantity": 1}]
+         - Subscribe: [{"action": "ADD_TO_SUBSCRIPTION", "productName": "Exact Name", "quantity": 1}]
+         - Remove: [{"action": "REMOVE_FROM_CART", "productName": "Exact Name"}]
+         - Clear: [{"action": "CLEAR_CART"}] <--- THIS WAS MISSING
+         - Checkout: [{"action": "OPEN_CHECKOUT_MODAL"}]
+      
+      3. **RULES:**
+         - Use exact product names from the inventory.
     `;
 
-    // ====================================================
-    // 3. PREPARE HISTORY
-    // ====================================================
+    // 3. CALL AI
     const conversationHistory = (history || []).map(msg => ({
         role: msg.sender === 'user' ? 'user' : 'assistant',
         content: msg.text
     }));
 
-    // ====================================================
-    // 4. CALL GROQ API
-    // ====================================================
     const completion = await groq.chat.completions.create({
       messages: [
         { role: 'system', content: systemPrompt },
@@ -86,76 +65,122 @@ const chatWithAI = async (req, res) => {
         { role: 'user', content: message }
       ],
       model: 'moonshotai/kimi-k2-instruct-0905', 
-      temperature: 0.1, // Low temp for accurate JSON
-      max_tokens: 500,
+      temperature: 0.1,
     });
 
     let aiReply = completion.choices[0]?.message?.content || "I'm speechless!";
+    console.log("RAW AI REPLY:", aiReply);
 
-    // ====================================================
-    // 5. DETECT & EXECUTE "ADD TO CART" (WITH LOGS)
-    // ====================================================
-    if (aiReply.trim().startsWith('{') && aiReply.includes("ADD_TO_CART")) {
-        console.log("DEBUG: AI triggered a tool action."); // <--- LOG 1
-        
+    // 4. SMART PARSING
+    const jsonMatch = aiReply.match(/(\[|\{)[\s\S]*(\]|\})/);
+
+    if (jsonMatch) {
         try {
-            const command = JSON.parse(aiReply);
-            console.log("DEBUG: Parsed Command:", command); // <--- LOG 2
-            
-            if (command.action === 'ADD_TO_CART') {
-                // A. Find the real product
-                const product = await Product.findOne({ name: command.productName });
-                
-                if (product) {
-                    console.log(`DEBUG: Product found in DB: ${product.name} (ID: ${product._id})`); // <--- LOG 3
+            let jsonString = jsonMatch[0];
+            jsonString = jsonString.replace(/\}\s*\{/g, '}, {');
+            if (jsonString.trim().startsWith('{')) jsonString = `[${jsonString}]`;
 
-                    // B. Find or Create Cart
-                    let cart = await Cart.findOne({ user: userId });
-                    if (!cart) {
-                        console.log("DEBUG: No cart found. Creating new cart..."); // <--- LOG 4
-                        cart = await Cart.create({ user: userId, items: [] });
+            let commands = JSON.parse(jsonString);
+            if (!Array.isArray(commands)) commands = [commands];
+
+            let successMessages = [];
+            let actionAttempted = false; 
+
+            for (const command of commands) {
+                if (!command.action) continue; 
+                actionAttempted = true;
+
+                // === SMART PRODUCT FINDER ===
+                let product = null;
+                if (command.productName) {
+                    product = await Product.findOne({ name: command.productName });
+                    if (!product) product = await Product.findOne({ name: { $regex: new RegExp(`^${command.productName}$`, 'i') } });
+                    if (!product) {
+                         const safeName = command.productName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                         product = await Product.findOne({ name: { $regex: new RegExp(safeName, 'i') } });
                     }
+                }
 
-                    // C. Update Cart Items
-                    const itemIndex = cart.items.findIndex(p => p.product.toString() === product._id.toString());
-
-                    if (itemIndex > -1) {
-                        cart.items[itemIndex].quantity += command.quantity;
-                        console.log("DEBUG: Updated existing item quantity."); // <--- LOG 5
-                    } else {
-                        cart.items.push({ 
-                            product: product._id, 
-                            name: product.name, 
-                            quantity: command.quantity, 
-                            price: product.price,
-                            image: product.imageUrl 
+                // --- ACTIONS ---
+                if (command.action === 'ADD_TO_CART') {
+                    if (product) {
+                        let cart = await Cart.findOne({ user: userId });
+                        if (!cart) cart = await Cart.create({ user: userId, items: [] });
+                        const itemIndex = cart.items.findIndex(p => p.product.toString() === product._id.toString());
+                        if (itemIndex > -1) cart.items[itemIndex].quantity += command.quantity;
+                        else cart.items.push({ 
+                            product: product._id, name: product.name, quantity: command.quantity, price: product.price, image: product.imageUrl 
                         });
-                        console.log("DEBUG: Pushed new item to cart."); // <--- LOG 6
+                        await cart.save();
+                        successMessages.push(`Added ${command.quantity} x ${product.name} to Cart`);
+                    } else {
+                        successMessages.push(`❌ Couldn't find "${command.productName}" in store.`);
                     }
+                }
 
-                    // D. Save to DB
-                    await cart.save();
-                    console.log("DEBUG: Cart saved successfully to MongoDB!"); // <--- LOG 7
+                else if (command.action === 'ADD_TO_SUBSCRIPTION') {
+                    if (product) {
+                        let sub = await Subscription.findOne({ user: userId });
+                        if (!sub) sub = await Subscription.create({ user: userId, items: [] });
+                        
+                        const existingItem = sub.items.find(i => i.product && i.product.toString() === product._id.toString());
+                        if (existingItem) existingItem.quantity += command.quantity;
+                        else sub.items.push({ 
+                             product: product._id, name: product.name, quantity: command.quantity, price: product.price 
+                        });
+                        
+                        sub.items = sub.items.filter(item => item.product && item.price != null);
+                        await sub.save();
+                        successMessages.push(`Subscribed to ${product.name}`);
+                    } else {
+                        successMessages.push(`❌ Couldn't find "${command.productName}" for subscription.`);
+                    }
+                }
 
-                    // E. Success Message
-                    aiReply = `✅ Success! I have added ${command.quantity} x ${product.name} to your cart.`;
-                } else {
-                    console.log(`DEBUG: Product NOT found for name: "${command.productName}"`); // <--- LOG 8 (Error)
-                    aiReply = `I tried to add "${command.productName}" but I couldn't find it in the database. Please check the exact name.`;
+                else if (command.action === 'REMOVE_FROM_CART') {
+                    let cart = await Cart.findOne({ user: userId });
+                    if(cart) {
+                         const initialLen = cart.items.length;
+                         // Fuzzy remove by name
+                         cart.items = cart.items.filter(item => !item.name.toLowerCase().includes(command.productName.toLowerCase()));
+                         if (cart.items.length < initialLen) {
+                            await cart.save();
+                            successMessages.push(`Removed ${command.productName}`);
+                         } else {
+                            successMessages.push(`Couldn't find ${command.productName} to remove.`);
+                         }
+                    }
+                }
+                
+                else if (command.action === 'CLEAR_CART') {
+                    await Cart.findOneAndUpdate({ user: userId }, { items: [] });
+                    successMessages.push("Cart Cleared");
+                }
+                
+                else if (command.action === 'OPEN_CHECKOUT_MODAL') {
+                    successMessages.push("Opening checkout details...");
+                    aiReply = "OPEN_CHECKOUT_MODAL_TRIGGER"; 
                 }
             }
+
+            if (actionAttempted && !aiReply.includes("TRIGGER")) {
+                if (successMessages.length > 0) {
+                    aiReply = `✅ Done! \n- ${successMessages.join('\n- ')}`;
+                } else {
+                    aiReply = "I tried to process that, but I encountered an issue finding the products.";
+                }
+            }
+
         } catch (e) {
-            console.error("DEBUG: JSON Parsing or DB Save failed:", e); // <--- LOG 9 (Crash)
+            console.error("JSON Parsing Error:", e);
         }
-    } else {
-        console.log("DEBUG: Normal chat response (No action).");
     }
 
     res.json({ reply: aiReply });
 
   } catch (error) {
-    console.error("DEBUG: Groq/AI Controller Error:", error);
-    res.status(500).json({ reply: "My AI brain is currently offline. Please try again later." });
+    console.error("AI Error:", error);
+    res.status(500).json({ reply: "My brain is offline." });
   }
 };
 

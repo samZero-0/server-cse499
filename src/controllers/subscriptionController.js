@@ -1,39 +1,62 @@
 const Subscription = require('../models/Subscription');
 
-// @desc Get user subscription
-// @route GET /api/subscription
+// @desc    Get User Subscription (Populated with Product Images)
+// @route   GET /api/subscription
 const getSubscription = async (req, res) => {
-  const sub = await Subscription.findOne({ user: req.user._id }).populate('items.product');
-  res.json(sub);
+  try {
+    const subscription = await Subscription.findOne({ user: req.user._id })
+      .populate('items.product'); // <--- CRITICAL: Fetches Image/Details from Product
+
+    if (subscription) {
+      res.json(subscription);
+    } else {
+      res.status(404).json({ message: 'No active subscription found' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: 'Server Error', error: error.message });
+  }
 };
 
-// @desc Create or Update subscription
-// @route POST /api/subscription
+// @desc    Update Subscription (Manual Bundle Builder)
+// @route   POST /api/subscription
 const updateSubscription = async (req, res) => {
   const { items, frequency } = req.body;
-  
-  // Calculate next delivery based on frequency
-  const nextDate = new Date();
-  if (frequency === 'Weekly') nextDate.setDate(nextDate.getDate() + 7);
-  else if (frequency === 'Bi-Weekly') nextDate.setDate(nextDate.getDate() + 14);
-  else nextDate.setDate(nextDate.getDate() + 30);
 
-  let sub = await Subscription.findOne({ user: req.user._id });
+  try {
+    let subscription = await Subscription.findOne({ user: req.user._id });
 
-  if (sub) {
-    sub.items = items;
-    sub.frequency = frequency;
-    sub.nextDeliveryDate = nextDate; // Reset date on update or keep logic
-    const updatedSub = await sub.save();
-    res.json(updatedSub);
-  } else {
-    const newSub = await Subscription.create({
-      user: req.user._id,
-      items,
-      frequency,
-      nextDeliveryDate: nextDate
-    });
-    res.status(201).json(newSub);
+    if (subscription) {
+      // Update existing
+      subscription.items = items;
+      subscription.frequency = frequency || subscription.frequency;
+      
+      // Calculate next delivery (Simple logic)
+      const now = new Date();
+      if (frequency === 'Weekly') now.setDate(now.getDate() + 7);
+      else if (frequency === 'Bi-Weekly') now.setDate(now.getDate() + 14);
+      else now.setMonth(now.getMonth() + 1);
+      subscription.nextDeliveryDate = now;
+
+      const updatedSubscription = await subscription.save();
+      // Re-populate to return full data
+      await updatedSubscription.populate('items.product'); 
+      res.json(updatedSubscription);
+    } else {
+      // Create new
+      const now = new Date();
+      now.setMonth(now.getMonth() + 1); // Default next month
+
+      const newSubscription = await Subscription.create({
+        user: req.user._id,
+        items,
+        frequency: frequency || 'Monthly',
+        nextDeliveryDate: now
+      });
+      await newSubscription.populate('items.product');
+      res.json(newSubscription);
+    }
+  } catch (error) {
+    res.status(500).json({ message: 'Server Error', error: error.message });
   }
 };
 

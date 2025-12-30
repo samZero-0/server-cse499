@@ -14,7 +14,7 @@ const aiRoutes = require('./routes/aiRoutes');
 const cartRoutes = require('./routes/cartRoutes');
 // Middleware
 app.use(cors({
-  origin: 'http://localhost:3000', // Allow only your frontend
+  origin: ["https://paltrypal.vercel.app", "http://localhost:3000"],  // Allow only your frontend
   credentials: true
 }));
 app.use(express.json()); // Allows parsing JSON body
