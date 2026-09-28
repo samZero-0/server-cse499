@@ -11,7 +11,8 @@ const protect = async (req, res, next) => {
       
       // Attach user to request object (exclude password)
       req.user = await User.findById(decoded.id).select('-password');
-      next();
+      if (!req.user) return res.status(401).json({ message: 'Not authorized, account not found' });
+      return next();
     } catch (error) {
       res.status(401).json({ message: 'Not authorized, token failed' });
     }

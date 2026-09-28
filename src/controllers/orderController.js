@@ -1,82 +1,75 @@
 const Order = require('../models/Order');
-const PantryItem = require('../models/PantryItem');
-const Product = require('../models/Product');
+const Cart = require('../models/Cart');
+const { placeOrder, OrderError } = require('../services/orderService');
 
-// @desc    Create new order AND add items to Pantry (Debug Version)
+// @desc    Place an order from the cart. Prices, delivery fee and total are computed on the server.
 // @route   POST /api/orders
 const createOrder = async (req, res) => {
-  const { orderItems, totalPrice } = req.body;
+  const { orderItems, paymentMethod, shippingAddress = {}, customerInfo = {} } = req.body;
 
-  console.log("--- STARTING ORDER CREATION ---");
-  console.log("Received Items:", JSON.stringify(orderItems, null, 2));
+  if (!shippingAddress.address || !shippingAddress.city || !customerInfo.name || !customerInfo.phone) {
+    return res.status(400).json({ message: 'Name, phone, address and city are required' });
+  }
 
-  if (orderItems && orderItems.length === 0) {
-    res.status(400);
-    throw new Error('No order items');
-  } else {
-    try {
-      // 1. Create the Transaction Record (The Order)
-      const order = new Order({
-        user: req.user._id,
-        orderItems,
-        totalPrice,
-        isPaid: true, 
-        isDelivered: false,
-      });
+  try {
+    const { order } = await placeOrder({
+      userId: req.user._id,
+      // Accept either { product, qty } (cart shape) or { productId, quantity }
+      items: (orderItems || []).map((item) => ({
+        productId: item.productId || item.product?._id || item.product,
+        quantity: item.quantity ?? item.qty,
+      })),
+      source: 'checkout',
+      paymentMethod,
+      shippingAddress: { address: shippingAddress.address, city: shippingAddress.city },
+      customerInfo: { name: customerInfo.name, phone: customerInfo.phone, email: customerInfo.email },
+    });
 
-      const createdOrder = await order.save();
-      console.log("Order Saved:", createdOrder._id);
+    // The order now owns these items
+    await Cart.updateOne({ user: req.user._id }, { $set: { items: [] } });
 
-      // 2. ADD TO PANTRY
-      for (const item of orderItems) {
-          // Normalize ID (Handle both populated object and raw string)
-          const productId = item.product._id ? item.product._id.toString() : item.product.toString();
-          const productName = item.name || "Unknown Item";
-
-          console.log(`Processing Pantry Item: ${productName} (ID: ${productId})`);
-
-          // Try to find the product to get fresh details
-          const product = await Product.findById(productId);
-
-          let shelfLifeDays = 14; // Default if not found
-          
-          if (product) {
-              shelfLifeDays = product.shelfLifeDays || 14;
-              console.log(`-> Found Product in DB. Shelf Life: ${shelfLifeDays} days`);
-          } else {
-              console.log(`-> WARNING: Product ${productId} NOT found in DB. Using default shelf life.`);
-          }
-
-          // Calculate Expiry
-          const expiryDate = new Date();
-          expiryDate.setDate(expiryDate.getDate() + shelfLifeDays);
-
-          // Create Pantry Item (Even if product lookup failed, we use the Order data)
-          await PantryItem.create({
-              user: req.user._id,
-              product: productId,
-              name: productName, 
-              shelfLifeDays: shelfLifeDays,
-              expiryDate: expiryDate,
-              status: 'Fresh'
-          });
-          console.log(`-> Added to Pantry: ${productName}`);
-      }
-
-      console.log("--- ORDER COMPLETE ---");
-      res.status(201).json(createdOrder);
-
-    } catch (error) {
-      console.error("CRITICAL ORDER ERROR:", error);
-      res.status(500).json({ message: "Order processed but failed to update Pantry" });
-    }
+    res.status(201).json(order);
+  } catch (error) {
+    if (error instanceof OrderError) return res.status(error.status).json({ message: error.message });
+    console.error('Create Order Error:', error);
+    res.status(500).json({ message: 'Could not place the order' });
   }
 };
 
 // @desc    Get logged in user orders
+// @route   GET /api/orders/myorders
 const getMyOrders = async (req, res) => {
   const orders = await Order.find({ user: req.user._id }).sort({ createdAt: -1 });
   res.json(orders);
 };
 
-module.exports = { createOrder, getMyOrders };
+// @desc    All orders (admin)
+// @route   GET /api/orders
+const getAllOrders = async (req, res) => {
+  const orders = await Order.find().sort({ createdAt: -1 }).populate('user', 'name email');
+  res.json(orders);
+};
+
+// @desc    Mark an order delivered (admin). Cash on delivery orders are paid on delivery.
+// @route   PUT /api/orders/:id/deliver
+const markDelivered = async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+
+    const now = new Date();
+    order.isDelivered = true;
+    order.deliveredAt = now;
+    if (!order.isPaid) {
+      order.isPaid = true;
+      order.paidAt = now;
+    }
+    await order.save();
+    await order.populate('user', 'name email');
+    res.json(order);
+  } catch (error) {
+    res.status(404).json({ message: 'Order not found' });
+  }
+};
+
+module.exports = { createOrder, getMyOrders, getAllOrders, markDelivered };

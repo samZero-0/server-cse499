@@ -21,14 +21,20 @@ const subscriptionSchema = mongoose.Schema({
   frequency: {
     type: String,
     required: true,
+    enum: ['Weekly', 'Bi-Weekly', 'Monthly'],
     default: 'Monthly',
   },
   nextDeliveryDate: {
     type: Date,
   },
+  // Only 'active' subscriptions are delivered by the scheduler
   status: {
     type: String,
+    enum: ['active', 'paused'],
     default: 'active',
+  },
+  lastDeliveryDate: {
+    type: Date,
   },
 }, {
   timestamps: true,

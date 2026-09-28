@@ -14,8 +14,9 @@ const getStats = async (req, res) => {
       const totalProducts = await Product.countDocuments();
       const totalOrders = await Order.countDocuments();
 
-      // Calculate Total Revenue
+      // Revenue = money actually collected (cash on delivery orders are paid on delivery)
       const revenueAgg = await Order.aggregate([
+        { $match: { isPaid: true } },
         { $group: { _id: null, total: { $sum: '$totalPrice' } } }
       ]);
       const totalRevenue = revenueAgg.length > 0 ? revenueAgg[0].total : 0;
@@ -37,28 +38,28 @@ const getStats = async (req, res) => {
 
     } else {
       // --- USER STATS ---
-      // 1. Total Spent
-      const orders = await Order.find({ user: req.user._id });
+      const orders = await Order.find({ user: req.user._id }).sort({ createdAt: -1 });
       const totalSpent = orders.reduce((acc, order) => acc + order.totalPrice, 0);
+      // Real savings: subscription discounts recorded on each order
+      const savings = orders.reduce((acc, order) => acc + (order.discount || 0), 0);
 
-      // 2. Pantry Count
-      const pantryCount = await PantryItem.countDocuments({ user: req.user._id });
+      // Pantry items that still have units left (older items without a quantity count as 1)
+      const pantryCount = await PantryItem.countDocuments({
+        user: req.user._id,
+        $or: [{ quantity: { $gt: 0 } }, { quantity: { $exists: false } }],
+      });
 
-      // 3. Subscription Status
       const subscription = await Subscription.findOne({ user: req.user._id });
-
-      // 4. "What has been purchased" (Category Breakdown Estimate)
-      // Note: A real implementation would aggregate this via MongoDB. 
-      // For now, we mock the savings as 5% of total spent (Loyalty Logic)
-      const estimatedSavings = Math.floor(totalSpent * 0.05);
+      const hasActiveSubscription = Boolean(subscription && subscription.status === 'active' && subscription.items.length > 0);
 
       res.json({
         role: 'user',
         totalSpent,
         pantryCount,
-        nextDelivery: subscription ? subscription.nextDeliveryDate : null,
-        savings: estimatedSavings,
-        recentOrders: orders.slice(0, 5) // Last 5 orders
+        savings,
+        subscriptionStatus: subscription ? (subscription.items.length ? subscription.status : 'empty') : 'none',
+        nextDelivery: hasActiveSubscription ? subscription.nextDeliveryDate : null,
+        recentOrders: orders.slice(0, 5)
       });
     }
   } catch (error) {

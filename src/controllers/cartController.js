@@ -22,7 +22,10 @@ const getCart = async (req, res) => {
 
 // @desc    Add Item
 const addToCart = async (req, res) => {
-  const { productId, quantity } = req.body;
+  const { productId } = req.body;
+  const quantity = parseInt(req.body.quantity ?? 1, 10);
+  if (!(quantity >= 1)) return res.status(400).json({ message: 'Quantity must be at least 1' });
+
   try {
     const product = await Product.findById(productId);
     if (!product) {
@@ -41,8 +44,18 @@ const addToCart = async (req, res) => {
         return dbId === productId;
     });
 
+    const inCart = itemIndex > -1 ? cart.items[itemIndex].quantity : 0;
+    if (inCart + quantity > product.stock) {
+      return res.status(409).json({
+        message: product.stock > inCart
+          ? `Only ${product.stock} of ${product.name} in stock${inCart ? ` (${inCart} already in your cart)` : ''}`
+          : `${product.name} is out of stock`
+      });
+    }
+
     if (itemIndex > -1) {
       cart.items[itemIndex].quantity += quantity;
+      cart.items[itemIndex].price = product.price; // Keep the cart on current prices
     } else {
       cart.items.push({
         product: productId,
@@ -65,7 +78,8 @@ const addToCart = async (req, res) => {
 // FIX: Checks both Product ID and Cart Item ID
 const updateCartItem = async (req, res) => {
   const { id } = req.params; // Can be Product ID OR Cart Item ID
-  const { quantity } = req.body;
+  const quantity = parseInt(req.body.quantity, 10);
+  if (!(quantity >= 1)) return res.status(400).json({ message: 'Quantity must be at least 1' });
 
   try {
     let cart = await Cart.findOne({ user: req.user._id });
@@ -74,12 +88,18 @@ const updateCartItem = async (req, res) => {
     // FIX: Match either Product ID OR the specific Item Subdocument ID
     const itemIndex = cart.items.findIndex(p => {
         const productId = p.product._id ? p.product._id.toString() : p.product.toString();
-        const itemId = p._id.toString(); 
+        const itemId = p._id.toString();
         return productId === id || itemId === id;
     });
 
     if (itemIndex > -1) {
+      const product = await Product.findById(cart.items[itemIndex].product);
+      if (!product) return res.status(404).json({ message: 'Product not found' });
+      if (quantity > product.stock) {
+        return res.status(409).json({ message: `Only ${product.stock} of ${product.name} in stock` });
+      }
       cart.items[itemIndex].quantity = quantity;
+      cart.items[itemIndex].price = product.price;
       await cart.save();
       return res.json(cart);
     }

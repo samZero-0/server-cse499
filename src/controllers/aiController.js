@@ -1,186 +1,119 @@
 const Groq = require('groq-sdk');
-const Order = require('../models/Order');
-const PantryItem = require('../models/PantryItem');
-const Product = require('../models/Product');
-const Cart = require('../models/Cart');
-const User = require('../models/User');
-const Subscription = require('../models/Subscription');
+const { toolDefinitions, runTool, storePolicies } = require('../services/aiTools');
 
-// @desc    Chat with AI (Smart: Chat + Actions + Clear Cart)
+const MODEL = 'openai/gpt-oss-120b';
+const MAX_TOOL_ROUNDS = 6; // Safety cap on search -> act -> confirm loops
+const MAX_HISTORY = 12; // Recent chat turns sent as context
+const MAX_RETRIES = 2; // Groq rejects malformed tool calls (tool_use_failed); retrying usually succeeds
+
+// The chat window renders plain text and "- " bullets, so strip markdown emphasis and headings
+const toPlainText = (text) =>
+  text
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/__(.+?)__/g, '$1')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/[ \t]+$/gm, '')
+    .trim();
+
+const complete = async (groq, params) => {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await groq.chat.completions.create(params);
+    } catch (error) {
+      const toolUseFailed =
+        error?.status === 400 &&
+        (error?.error?.error?.code === 'tool_use_failed' || String(error?.message).includes('tool_use_failed'));
+      if (!toolUseFailed || attempt >= MAX_RETRIES) throw error;
+    }
+  }
+};
+
+const systemPrompt = (userName) => `You are the PantryPal shopping assistant for ${userName || 'the user'}.
+You help them shop groceries, manage their cart, their pantry and their recurring subscription.
+
+How to work:
+- Use the tools for anything about products, prices, stock, the cart, the pantry or the subscription. Never guess ids, prices or stock.
+- To add something, first call search_products, pick the best match, then add it. If several products fit and the choice matters, ask.
+- If a tool returns an error, relay its numbers exactly (e.g. how many more can be added) and only suggest things the tools can actually do.
+- Only call open_checkout when the user wants to check out or place the order. You cannot place orders yourself; the user confirms in the checkout form.
+- For recipe or "what should I cook" questions, check the pantry and prefer items that expire soonest.
+
+${storePolicies}
+
+Reply style: short, friendly plain text. Use "- " bullet lines for lists. No markdown headings, bold, tables or emojis. Prices in ৳.`;
+
+// @desc    Chat with the shopping assistant (tool-calling agent)
 // @route   POST /api/ai/chat
+// @returns { reply, actions: { cartChanged, subscriptionChanged, openCheckout } }
 const chatWithAI = async (req, res) => {
   const { message, history } = req.body;
-  const userId = req.user._id;
+  if (!message || typeof message !== 'string') {
+    return res.status(400).json({ reply: 'Please type a message.' });
+  }
 
-  const groqApiKey = process.env.GROQ_API_KEY;
-  if (!groqApiKey) return res.status(500).json({ reply: "AI is unavailable." });
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) return res.status(500).json({ reply: 'The assistant is not configured right now.' });
+  const groq = new Groq({ apiKey });
 
-  const groq = new Groq({ apiKey: groqApiKey });
+  const effects = { cartChanged: false, subscriptionChanged: false, openCheckout: false };
+  const context = { userId: req.user._id, effects };
+
+  const messages = [
+    { role: 'system', content: systemPrompt(req.user.name) },
+    ...(Array.isArray(history) ? history : [])
+      .filter((m) => m && typeof m.text === 'string' && m.text.trim())
+      .slice(-MAX_HISTORY)
+      .map((m) => ({ role: m.sender === 'user' ? 'user' : 'assistant', content: m.text })),
+    { role: 'user', content: message },
+  ];
 
   try {
-    // 1. GATHER CONTEXT
-    const products = await Product.find().select('name price stock').limit(100);
-    const productCatalog = products.map(p => `- ${p.name}`).join('\n');
+    for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+      const completion = await complete(groq, {
+        model: MODEL,
+        messages,
+        tools: toolDefinitions,
+        // On the last round, force a text answer instead of more tool calls
+        tool_choice: round === MAX_TOOL_ROUNDS ? 'none' : 'auto',
+        temperature: 1,
+        top_p: 1,
+        max_completion_tokens: 2048,
+        reasoning_effort: 'medium',
+      });
 
-    const userCart = await Cart.findOne({ user: userId });
-    let cartSummary = "Empty";
-    if (userCart && userCart.items.length > 0) {
-        cartSummary = userCart.items.map(item => `${item.quantity}x ${item.name}`).join(', ');
-    }
+      const reply = completion.choices[0]?.message;
+      const toolCalls = reply?.tool_calls || [];
 
-    // 2. SYSTEM PROMPT (Added CLEAR_CART back!)
-    const systemPrompt = `
-      You are PantryPal AI.
-      
-      --- INVENTORY ---
-      ${productCatalog}
-      
-      --- CURRENT CART ---
-      ${cartSummary}
-      
-      --- INSTRUCTIONS ---
-      1. **GENERAL CHAT:** If the user greets you ("hi"), asks for recipes, or asks questions, use **NORMAL TEXT**.
-      
-      2. **SHOPPING ACTIONS:** If the user asks to Add, Remove, Subscribe, Clear, or Checkout, return a **JSON ARRAY**:
-         - Add: [{"action": "ADD_TO_CART", "productName": "Exact Name", "quantity": 1}]
-         - Subscribe: [{"action": "ADD_TO_SUBSCRIPTION", "productName": "Exact Name", "quantity": 1}]
-         - Remove: [{"action": "REMOVE_FROM_CART", "productName": "Exact Name"}]
-         - Clear: [{"action": "CLEAR_CART"}] <--- THIS WAS MISSING
-         - Checkout: [{"action": "OPEN_CHECKOUT_MODAL"}]
-      
-      3. **RULES:**
-         - Use exact product names from the inventory.
-    `;
+      if (!toolCalls.length) {
+        const text = toPlainText(reply?.content || '') || 'Done.';
+        return res.json({ reply: text, actions: effects });
+      }
 
-    // 3. CALL AI
-    const conversationHistory = (history || []).map(msg => ({
-        role: msg.sender === 'user' ? 'user' : 'assistant',
-        content: msg.text
-    }));
+      // Keep only the fields the API accepts back (drop the model's reasoning)
+      messages.push({ role: 'assistant', content: reply.content || '', tool_calls: toolCalls });
 
-    const completion = await groq.chat.completions.create({
-      messages: [
-        { role: 'system', content: systemPrompt },
-        ...conversationHistory,
-        { role: 'user', content: message }
-      ],
-      model: 'moonshotai/kimi-k2-instruct-0905', 
-      temperature: 0.1,
-    });
-
-    let aiReply = completion.choices[0]?.message?.content || "I'm speechless!";
-    console.log("RAW AI REPLY:", aiReply);
-
-    // 4. SMART PARSING
-    const jsonMatch = aiReply.match(/(\[|\{)[\s\S]*(\]|\})/);
-
-    if (jsonMatch) {
+      for (const call of toolCalls) {
+        let args = {};
         try {
-            let jsonString = jsonMatch[0];
-            jsonString = jsonString.replace(/\}\s*\{/g, '}, {');
-            if (jsonString.trim().startsWith('{')) jsonString = `[${jsonString}]`;
-
-            let commands = JSON.parse(jsonString);
-            if (!Array.isArray(commands)) commands = [commands];
-
-            let successMessages = [];
-            let actionAttempted = false; 
-
-            for (const command of commands) {
-                if (!command.action) continue; 
-                actionAttempted = true;
-
-                // === SMART PRODUCT FINDER ===
-                let product = null;
-                if (command.productName) {
-                    product = await Product.findOne({ name: command.productName });
-                    if (!product) product = await Product.findOne({ name: { $regex: new RegExp(`^${command.productName}$`, 'i') } });
-                    if (!product) {
-                         const safeName = command.productName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                         product = await Product.findOne({ name: { $regex: new RegExp(safeName, 'i') } });
-                    }
-                }
-
-                // --- ACTIONS ---
-                if (command.action === 'ADD_TO_CART') {
-                    if (product) {
-                        let cart = await Cart.findOne({ user: userId });
-                        if (!cart) cart = await Cart.create({ user: userId, items: [] });
-                        const itemIndex = cart.items.findIndex(p => p.product.toString() === product._id.toString());
-                        if (itemIndex > -1) cart.items[itemIndex].quantity += command.quantity;
-                        else cart.items.push({ 
-                            product: product._id, name: product.name, quantity: command.quantity, price: product.price, image: product.imageUrl 
-                        });
-                        await cart.save();
-                        successMessages.push(`Added ${command.quantity} x ${product.name} to Cart`);
-                    } else {
-                        successMessages.push(`❌ Couldn't find "${command.productName}" in store.`);
-                    }
-                }
-
-                else if (command.action === 'ADD_TO_SUBSCRIPTION') {
-                    if (product) {
-                        let sub = await Subscription.findOne({ user: userId });
-                        if (!sub) sub = await Subscription.create({ user: userId, items: [] });
-                        
-                        const existingItem = sub.items.find(i => i.product && i.product.toString() === product._id.toString());
-                        if (existingItem) existingItem.quantity += command.quantity;
-                        else sub.items.push({ 
-                             product: product._id, name: product.name, quantity: command.quantity, price: product.price 
-                        });
-                        
-                        sub.items = sub.items.filter(item => item.product && item.price != null);
-                        await sub.save();
-                        successMessages.push(`Subscribed to ${product.name}`);
-                    } else {
-                        successMessages.push(`❌ Couldn't find "${command.productName}" for subscription.`);
-                    }
-                }
-
-                else if (command.action === 'REMOVE_FROM_CART') {
-                    let cart = await Cart.findOne({ user: userId });
-                    if(cart) {
-                         const initialLen = cart.items.length;
-                         // Fuzzy remove by name
-                         cart.items = cart.items.filter(item => !item.name.toLowerCase().includes(command.productName.toLowerCase()));
-                         if (cart.items.length < initialLen) {
-                            await cart.save();
-                            successMessages.push(`Removed ${command.productName}`);
-                         } else {
-                            successMessages.push(`Couldn't find ${command.productName} to remove.`);
-                         }
-                    }
-                }
-                
-                else if (command.action === 'CLEAR_CART') {
-                    await Cart.findOneAndUpdate({ user: userId }, { items: [] });
-                    successMessages.push("Cart Cleared");
-                }
-                
-                else if (command.action === 'OPEN_CHECKOUT_MODAL') {
-                    successMessages.push("Opening checkout details...");
-                    aiReply = "OPEN_CHECKOUT_MODAL_TRIGGER"; 
-                }
-            }
-
-            if (actionAttempted && !aiReply.includes("TRIGGER")) {
-                if (successMessages.length > 0) {
-                    aiReply = `✅ Done! \n- ${successMessages.join('\n- ')}`;
-                } else {
-                    aiReply = "I tried to process that, but I encountered an issue finding the products.";
-                }
-            }
-
-        } catch (e) {
-            console.error("JSON Parsing Error:", e);
+          args = JSON.parse(call.function.arguments || '{}');
+        } catch {
+          args = {};
         }
+        const result = await runTool(call.function.name, args, context);
+        messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
+      }
     }
 
-    res.json({ reply: aiReply });
-
+    // Unreachable in practice: the final round cannot call tools
+    res.json({ reply: 'Done.', actions: effects });
   } catch (error) {
-    console.error("AI Error:", error);
-    res.status(500).json({ reply: "My brain is offline." });
+    console.error('AI Error:', error?.status, error?.message);
+    const reply =
+      error?.status === 429
+        ? 'The assistant is busy right now. Please try again in a moment.'
+        : 'Sorry, I could not reach the assistant. Please try again.';
+    // Tools may have already run before the failure; report their effects so the UI stays in sync
+    res.status(502).json({ reply, actions: effects });
   }
 };
 

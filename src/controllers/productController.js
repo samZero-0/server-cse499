@@ -13,18 +13,22 @@ const createProduct = async (req, res) => {
   // Destructure imageUrl from the body
   const { name, category, price, stock, shelfLifeDays, description, imageUrl } = req.body;
 
-  const product = new Product({
-    name, 
-    category, 
-    price, 
-    stock, 
-    shelfLifeDays, 
-    description,
-    imageUrl // <--- Save it here
-  });
+  try {
+    const product = new Product({
+      name,
+      category,
+      price,
+      stock,
+      shelfLifeDays,
+      description,
+      imageUrl: imageUrl || undefined // Empty string falls back to the schema default
+    });
 
-  const createdProduct = await product.save();
-  res.status(201).json(createdProduct);
+    const createdProduct = await product.save();
+    res.status(201).json(createdProduct);
+  } catch (error) {
+    res.status(400).json({ message: 'Invalid product data', error: error.message });
+  }
 };
 const createBulkProducts = async (req, res) => {
   try {
